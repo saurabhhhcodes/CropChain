@@ -1,0 +1,677 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "./lib/openzeppelin/security/Pausable.sol";
+import "./lib/openzeppelin/security/ReentrancyGuard.sol";
+import "./lib/openzeppelin/access/AccessControl.sol";
+
+contract CropChain is Pausable, ReentrancyGuard, AccessControl {
+    bytes32 public constant FARMER_ROLE = keccak256("FARMER_ROLE");
+    bytes32 public constant MANDI_ROLE = keccak256("MANDI_ROLE");
+    bytes32 public constant TRANSPORTER_ROLE = keccak256("TRANSPORTER_ROLE");
+    bytes32 public constant RETAILER_ROLE = keccak256("RETAILER_ROLE");
+    bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
+
+    enum Stage {
+        Farmer,
+        Mandi,
+        Transport,
+        Retailer
+    }
+
+    enum ActorRole {
+        None,
+        Farmer,
+        Mandi,
+        Transporter,
+        Retailer,
+        Oracle,
+        Admin
+    }
+
+    struct CropBatch {
+        bytes32 batchId;
+        bytes32 cropTypeHash;
+        string ipfsCID;
+        uint256 quantity;
+        uint256 createdAt;
+        address creator;
+        bool exists;
+        bool isRecalled;
+        int256 currentTemperature;
+        int256 currentHumidity;
+        bool isSpoiled;
+    }
+
+    struct SupplyChainUpdate {
+        Stage stage;
+        string actorName;
+        string location;
+        uint256 timestamp;
+        string notes;
+        address updatedBy;
+    }
+
+    struct MarketListing {
+        uint256 listingId;
+        bytes32 batchId;
+        address seller;
+        uint256 quantity;
+        uint256 quantityAvailable;
+        uint256 unitPriceWei;
+        bool active;
+        uint256 createdAt;
+    }
+
+    struct PriceObservation {
+        uint256 timestamp;
+        uint256 priceWei;
+    }
+
+    mapping(bytes32 => CropBatch) public cropBatches;
+    mapping(bytes32 => SupplyChainUpdate[]) private _batchUpdates;
+    mapping(address => ActorRole) public roles;
+    mapping(uint256 => MarketListing) public listings;
+    mapping(bytes32 => PriceObservation[]) private _priceObservations;
+    mapping(bytes32 => uint256) public latestOraclePrice;
+    mapping(address => uint256) public pendingWithdrawals;
+    /// @dev Tracks the total quantity currently committed across all active listings for a batch.
+    ///      Prevents double-listing and over-allocation beyond the physical batch quantity.
+    mapping(bytes32 => uint256) public batchListedQuantity;
+
+    bytes32[] public allBatchIds;
+
+    address public owner;
+    uint256 public nextListingId;
+    uint256 public twapWindow;
+    uint256 public maxPriceDeviationBps;
+
+    event BatchCreated(bytes32 indexed batchId, string ipfsCID, uint256 quantity, address indexed creator);
+    event BatchUpdated(bytes32 indexed batchId, Stage stage, string actorName, string location, address indexed updatedBy);
+    event BatchRecalled(bytes32 indexed batchId, address indexed triggeredBy);
+    event RoleUpdated(address indexed user, ActorRole role);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event ListingCreated(uint256 indexed listingId, bytes32 indexed batchId, address indexed seller, uint256 quantity, uint256 unitPriceWei);
+    event ListingPurchased(uint256 indexed listingId, address indexed buyer, uint256 quantity, uint256 totalPaidWei);
+    event ListingCancelled(uint256 indexed listingId, address indexed cancelledBy);
+    event ProceedsWithdrawn(address indexed account, uint256 amountWei);
+    event SpotPriceRecorded(bytes32 indexed cropTypeHash, uint256 priceWei, uint256 timestamp);
+    event TwapConfigUpdated(uint256 twapWindowSeconds, uint256 maxPriceDeviationBps);
+    event IoTDataRequested(bytes32 indexed batchId, address requester);
+    event IoTDataFulfilled(bytes32 indexed batchId, int256 temperature, int256 humidity, bool isSpoiled);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner");
+        _;
+    }
+
+    modifier onlyAuthorized() {
+        require(roles[msg.sender] != ActorRole.None, "Not authorized");
+        _;
+    }
+
+    modifier batchExists(bytes32 batchId) {
+        require(cropBatches[batchId].exists, "Batch not found");
+        _;
+    }
+
+    modifier onlyOracleOrAdmin() {
+        ActorRole role = roles[msg.sender];
+        require(role == ActorRole.Oracle || role == ActorRole.Admin, "Only oracle/admin");
+        _;
+    }
+
+    constructor() {
+        owner = msg.sender;
+        roles[msg.sender] = ActorRole.Admin;
+        nextListingId = 1;
+        twapWindow = 1 hours;
+        maxPriceDeviationBps = 1500;
+        
+        // Grant DEFAULT_ADMIN_ROLE to deployer
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        
+        // Set up role hierarchy
+        _setRoleAdmin(FARMER_ROLE, DEFAULT_ADMIN_ROLE);
+        _setRoleAdmin(MANDI_ROLE, DEFAULT_ADMIN_ROLE);
+        _setRoleAdmin(TRANSPORTER_ROLE, DEFAULT_ADMIN_ROLE);
+        _setRoleAdmin(RETAILER_ROLE, DEFAULT_ADMIN_ROLE);
+        _setRoleAdmin(ORACLE_ROLE, DEFAULT_ADMIN_ROLE);
+    }
+
+    function setRole(address user, ActorRole role) external onlyOwner nonReentrant {
+        require(user != address(0), "Invalid address");
+        require(user != owner, "Cannot change owner role via setRole");
+        // Admin role must be managed exclusively through transferOwnership
+        require(role != ActorRole.Admin, "Use transferOwnership to assign Admin");
+
+        // Revoke the previous OZ AccessControl role for this user if one was set
+        ActorRole previousRole = roles[user];
+        if (previousRole == ActorRole.Farmer) _revokeRole(FARMER_ROLE, user);
+        else if (previousRole == ActorRole.Mandi) _revokeRole(MANDI_ROLE, user);
+        else if (previousRole == ActorRole.Transporter) _revokeRole(TRANSPORTER_ROLE, user);
+        else if (previousRole == ActorRole.Retailer) _revokeRole(RETAILER_ROLE, user);
+        else if (previousRole == ActorRole.Oracle) _revokeRole(ORACLE_ROLE, user);
+
+        roles[user] = role;
+
+        // Keep OZ AccessControl in sync so onlyRole() guards match the legacy mapping
+        if (role == ActorRole.Farmer) _grantRole(FARMER_ROLE, user);
+        else if (role == ActorRole.Mandi) _grantRole(MANDI_ROLE, user);
+        else if (role == ActorRole.Transporter) _grantRole(TRANSPORTER_ROLE, user);
+        else if (role == ActorRole.Retailer) _grantRole(RETAILER_ROLE, user);
+        else if (role == ActorRole.Oracle) _grantRole(ORACLE_ROLE, user);
+
+        emit RoleUpdated(user, role);
+    }
+
+    function transferOwnership(address newOwner) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        require(newOwner != address(0), "Invalid address");
+        require(newOwner != owner, "Already owner");
+
+        address previousOwner = owner;
+        owner = newOwner;
+
+        // Transfer legacy admin role: clear old owner, elevate new owner
+        roles[previousOwner] = ActorRole.None;
+        roles[newOwner] = ActorRole.Admin;
+
+        // Sync OZ AccessControl: revoke DEFAULT_ADMIN_ROLE from old owner,
+        // grant it to new owner so privileged functions remain consistent
+        _revokeRole(DEFAULT_ADMIN_ROLE, previousOwner);
+        _grantRole(DEFAULT_ADMIN_ROLE, newOwner);
+
+        emit OwnershipTransferred(previousOwner, newOwner);
+    }
+
+    function pause() external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        _pause();
+    }
+
+    function unpause() external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        _unpause();
+    }
+
+    function setPaused(bool shouldPause) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        if (shouldPause) {
+            _pause();
+        } else {
+            _unpause();
+        }
+    }
+
+    function setTwapConfig(uint256 twapWindowSeconds, uint256 maxDeviationBps) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        require(twapWindowSeconds > 0, "Window=0");
+        require(maxDeviationBps <= 5000, "Deviation too high");
+
+        twapWindow = twapWindowSeconds;
+        maxPriceDeviationBps = maxDeviationBps;
+
+        emit TwapConfigUpdated(twapWindowSeconds, maxDeviationBps);
+    }
+
+    function createBatch(
+        bytes32 batchId,
+        bytes32 cropTypeHash,
+        string calldata ipfsCID,
+        uint256 quantity,
+        string calldata actorName,
+        string calldata location,
+        string calldata notes
+    ) external onlyRole(FARMER_ROLE) whenNotPaused nonReentrant {
+        // Input validations to prevent malformed data and gas exhaustion attacks
+        _validateStringLength(ipfsCID, 46, 64, "Invalid IPFS CID length");
+        _validateStringLength(actorName, 2, 50, "Actor name length invalid");
+        _validateStringLength(location, 2, 100, "Location length invalid");
+        _validateStringLength(notes, 0, 500, "Notes too long");
+        
+        require(!cropBatches[batchId].exists, "Batch already exists");
+        require(batchId != bytes32(0), "Invalid batch ID");
+        require(cropTypeHash != bytes32(0), "Invalid crop type");
+        require(quantity > 0, "Quantity must be > 0");
+
+        cropBatches[batchId] = CropBatch({
+            batchId: batchId,
+            cropTypeHash: cropTypeHash,
+            ipfsCID: ipfsCID,
+            quantity: quantity,
+            createdAt: block.timestamp,
+            creator: msg.sender,
+            exists: true,
+            isRecalled: false,
+            currentTemperature: 0,
+            currentHumidity: 0,
+            isSpoiled: false
+        });
+
+        _batchUpdates[batchId].push(
+            SupplyChainUpdate({
+                stage: Stage.Farmer,
+                actorName: actorName,
+                location: location,
+                timestamp: block.timestamp,
+                notes: notes,
+                updatedBy: msg.sender
+            })
+        );
+
+        allBatchIds.push(batchId);
+
+        emit BatchCreated(batchId, ipfsCID, quantity, msg.sender);
+    }
+
+    function updateBatch(
+        bytes32 batchId,
+        Stage stage,
+        string calldata actorName,
+        string calldata location,
+        string calldata notes
+    ) external whenNotPaused nonReentrant batchExists(batchId) {
+        // Input validations to prevent malformed data and gas exhaustion attacks
+        _validateStringLength(actorName, 2, 50, "Actor name length invalid");
+        _validateStringLength(location, 2, 100, "Location length invalid");
+        _validateStringLength(notes, 0, 500, "Notes too long");
+        
+        require(!cropBatches[batchId].isRecalled, "Batch is recalled");
+        require(bytes(actorName).length > 0, "Actor required");
+        require(bytes(location).length > 0, "Location required");
+        require(_isNextStage(batchId, stage), "Invalid stage transition");
+
+        // Dynamic role checks based on stage transition
+        require(_canUpdateStage(batchId, stage), "Role not allowed for this stage transition");
+
+        _batchUpdates[batchId].push(
+            SupplyChainUpdate({
+                stage: stage,
+                actorName: actorName,
+                location: location,
+                timestamp: block.timestamp,
+                notes: notes,
+                updatedBy: msg.sender
+            })
+        );
+
+        emit BatchUpdated(batchId, stage, actorName, location, msg.sender);
+    }
+
+    function recallBatch(bytes32 batchId) external onlyOwner whenNotPaused nonReentrant batchExists(batchId) {
+        cropBatches[batchId].isRecalled = true;
+        emit BatchRecalled(batchId, msg.sender);
+    }
+
+    function createListing(bytes32 batchId, uint256 quantity, uint256 unitPriceWei)
+        external
+        onlyAuthorized
+        whenNotPaused
+        nonReentrant
+        batchExists(batchId)
+        returns (uint256)
+    {
+        CropBatch storage batch = cropBatches[batchId];
+        require(!batch.isRecalled, "Batch is recalled");
+        require(quantity > 0, "Quantity must be > 0");
+        require(unitPriceWei > 0, "Price=0");
+
+        ActorRole senderRole = roles[msg.sender];
+        require(
+            msg.sender == batch.creator || senderRole == ActorRole.Mandi || senderRole == ActorRole.Admin,
+            "Only creator/mandi/admin"
+        );
+
+        // FIX: Validate against remaining unlisted quantity, not the static batch total.
+        // This prevents double-listing and over-allocation attacks where multiple listings
+        // for the same batchId could collectively exceed the physical batch quantity.
+        uint256 alreadyListed = batchListedQuantity[batchId];
+        require(
+            quantity <= batch.quantity - alreadyListed,
+            "Quantity exceeds available unlisted batch supply"
+        );
+        batchListedQuantity[batchId] = alreadyListed + quantity;
+
+        uint256 listingId = nextListingId;
+        nextListingId = listingId + 1;
+
+        listings[listingId] = MarketListing({
+            listingId: listingId,
+            batchId: batchId,
+            seller: msg.sender,
+            quantity: quantity,
+            quantityAvailable: quantity,
+            unitPriceWei: unitPriceWei,
+            active: true,
+            createdAt: block.timestamp
+        });
+
+        emit ListingCreated(listingId, batchId, msg.sender, quantity, unitPriceWei);
+
+        return listingId;
+    }
+
+    function buyFromListing(uint256 listingId, uint256 quantity)
+        external
+        payable
+        whenNotPaused
+        nonReentrant
+    {
+        MarketListing storage listing = listings[listingId];
+        require(listing.active, "Listing inactive");
+        require(quantity > 0 && quantity <= listing.quantityAvailable, "Invalid quantity");
+
+        CropBatch storage batch = cropBatches[listing.batchId];
+        require(batch.exists && !batch.isRecalled, "Batch unavailable");
+
+        uint256 twapPrice = getTwapPrice(batch.cropTypeHash, twapWindow);
+        if (twapPrice > 0) {
+            require(_withinDeviation(listing.unitPriceWei, twapPrice, maxPriceDeviationBps), "TWAP deviation too high");
+        }
+
+        uint256 totalCost = listing.unitPriceWei * quantity;
+        require(msg.value >= totalCost, "Insufficient payment");
+
+        listing.quantityAvailable -= quantity;
+        // FIX: Release sold units from the batch's listed-quantity tracker so those
+        // physical units are correctly accounted for as having been fulfilled/sold.
+        batchListedQuantity[listing.batchId] -= quantity;
+        if (listing.quantityAvailable == 0) {
+            listing.active = false;
+        }
+
+        pendingWithdrawals[listing.seller] += totalCost;
+
+        uint256 refund = msg.value - totalCost;
+        if (refund > 0) {
+            pendingWithdrawals[msg.sender] += refund;
+        }
+
+        emit ListingPurchased(listingId, msg.sender, quantity, totalCost);
+    }
+
+    function cancelListing(uint256 listingId) external whenNotPaused nonReentrant {
+        MarketListing storage listing = listings[listingId];
+        require(listing.active, "Listing inactive");
+        require(msg.sender == listing.seller || hasRole(DEFAULT_ADMIN_ROLE, msg.sender), "Not allowed");
+
+        // FIX: Restore the listing's remaining available quantity back to the batch's
+        // listed-quantity tracker so those units can be re-listed or sold via a new listing.
+        batchListedQuantity[listing.batchId] -= listing.quantityAvailable;
+
+        listing.active = false;
+        listing.quantityAvailable = 0;
+
+        emit ListingCancelled(listingId, msg.sender);
+    }
+
+    function withdrawProceeds() external whenNotPaused nonReentrant {
+        uint256 amount = pendingWithdrawals[msg.sender];
+        require(amount > 0, "No proceeds");
+
+        pendingWithdrawals[msg.sender] = 0;
+
+        (bool sent, ) = payable(msg.sender).call{value: amount}("");
+        require(sent, "Withdraw failed");
+
+        emit ProceedsWithdrawn(msg.sender, amount);
+    }
+
+    function recordSpotPrice(bytes32 cropTypeHash, uint256 priceWei)
+        external
+        onlyOracleOrAdmin
+        whenNotPaused
+        nonReentrant
+    {
+        require(cropTypeHash != bytes32(0), "Invalid crop type");
+        require(priceWei > 0, "Price=0");
+
+        _priceObservations[cropTypeHash].push(
+            PriceObservation({timestamp: block.timestamp, priceWei: priceWei})
+        );
+        latestOraclePrice[cropTypeHash] = priceWei;
+
+        emit SpotPriceRecorded(cropTypeHash, priceWei, block.timestamp);
+    }
+
+    function getBatch(bytes32 batchId) external view batchExists(batchId) returns (CropBatch memory) {
+        return cropBatches[batchId];
+    }
+
+    function getBatchUpdates(bytes32 batchId)
+        external
+        view
+        batchExists(batchId)
+        returns (SupplyChainUpdate[] memory)
+    {
+        return _batchUpdates[batchId];
+    }
+
+    function getLatestUpdate(bytes32 batchId)
+        external
+        view
+        batchExists(batchId)
+        returns (SupplyChainUpdate memory)
+    {
+        uint256 length = _batchUpdates[batchId].length;
+        require(length > 0, "No updates");
+        return _batchUpdates[batchId][length - 1];
+    }
+
+    function getTotalBatches() external view returns (uint256) {
+        return allBatchIds.length;
+    }
+
+    function getBatchIdByIndex(uint256 index) external view returns (bytes32) {
+        require(index < allBatchIds.length, "Out of bounds");
+        return allBatchIds[index];
+    }
+
+    function getPriceObservationCount(bytes32 cropTypeHash) external view returns (uint256) {
+        return _priceObservations[cropTypeHash].length;
+    }
+
+    function getTwapPrice(bytes32 cropTypeHash, uint256 windowSeconds)
+        public
+        view
+        returns (uint256)
+    {
+        PriceObservation[] storage observations = _priceObservations[cropTypeHash];
+        uint256 len = observations.length;
+
+        if (len == 0) {
+            return 0;
+        }
+
+        if (windowSeconds == 0) {
+            return observations[len - 1].priceWei;
+        }
+
+        uint256 cutoff = block.timestamp > windowSeconds ? block.timestamp - windowSeconds : 0;
+        uint256 endTime = block.timestamp;
+        uint256 weightedSum;
+        uint256 totalWeight;
+
+        for (uint256 i = len; i > 0; ) {
+            unchecked {
+                i -= 1;
+            }
+
+            PriceObservation storage current = observations[i];
+            uint256 segmentStart = current.timestamp > cutoff ? current.timestamp : cutoff;
+
+            if (endTime > segmentStart) {
+                uint256 dt = endTime - segmentStart;
+                weightedSum += current.priceWei * dt;
+                totalWeight += dt;
+            }
+
+            if (current.timestamp <= cutoff) {
+                break;
+            }
+
+            endTime = current.timestamp;
+        }
+
+        if (totalWeight == 0) {
+            return observations[len - 1].priceWei;
+        }
+
+        return weightedSum / totalWeight;
+    }
+
+    function grantStakeholderRole(bytes32 role, address account) external onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
+        require(account != address(0), "Invalid address");
+        require(
+            role == FARMER_ROLE || role == MANDI_ROLE || role == TRANSPORTER_ROLE || role == RETAILER_ROLE || role == ORACLE_ROLE,
+            "Invalid stakeholder role"
+        );
+
+        // Sync the legacy roles mapping so onlyAuthorized and createListing checks work
+        if (role == FARMER_ROLE) roles[account] = ActorRole.Farmer;
+        else if (role == MANDI_ROLE) roles[account] = ActorRole.Mandi;
+        else if (role == TRANSPORTER_ROLE) roles[account] = ActorRole.Transporter;
+        else if (role == RETAILER_ROLE) roles[account] = ActorRole.Retailer;
+        else if (role == ORACLE_ROLE) roles[account] = ActorRole.Oracle;
+
+        _grantRole(role, account);
+        emit RoleUpdated(account, roles[account]);
+    }
+
+    function _canUpdate(Stage stage, ActorRole role) internal pure returns (bool) {
+        if (stage == Stage.Farmer && role == ActorRole.Farmer) return true;
+        if (stage == Stage.Mandi && role == ActorRole.Mandi) return true;
+        if (stage == Stage.Transport && role == ActorRole.Transporter) return true;
+        if (stage == Stage.Retailer && role == ActorRole.Retailer) return true;
+        return false;
+    }
+
+    function _canUpdateStage(bytes32 batchId, Stage newStage) internal view returns (bool) {
+        SupplyChainUpdate[] storage updates = _batchUpdates[batchId];
+        
+        // Admin can always update
+        if (hasRole(DEFAULT_ADMIN_ROLE, msg.sender)) {
+            return true;
+        }
+        
+        // Get current stage
+        Stage currentStage;
+        if (updates.length == 0) {
+            currentStage = Stage.Farmer;
+        } else {
+            currentStage = updates[updates.length - 1].stage;
+        }
+        
+        // Check role-based stage transitions
+        if (currentStage == Stage.Farmer && newStage == Stage.Mandi) {
+            return hasRole(MANDI_ROLE, msg.sender);
+        }
+        if (currentStage == Stage.Mandi && newStage == Stage.Transport) {
+            return hasRole(TRANSPORTER_ROLE, msg.sender);
+        }
+        if (currentStage == Stage.Transport && newStage == Stage.Retailer) {
+            return hasRole(RETAILER_ROLE, msg.sender);
+        }
+        
+        return false;
+    }
+
+    function _isNextStage(bytes32 batchId, Stage newStage) internal view returns (bool) {
+        SupplyChainUpdate[] storage updates = _batchUpdates[batchId];
+
+        if (updates.length == 0) {
+            return newStage == Stage.Farmer;
+        }
+
+        Stage last = updates[updates.length - 1].stage;
+        return uint256(newStage) == uint256(last) + 1;
+    }
+
+    function _withinDeviation(uint256 observed, uint256 referencePrice, uint256 bps)
+        internal
+        pure
+        returns (bool)
+    {
+        uint256 lower = (referencePrice * (10_000 - bps)) / 10_000;
+        uint256 upper = (referencePrice * (10_000 + bps)) / 10_000;
+        return observed >= lower && observed <= upper;
+    }
+
+    /**
+     * @dev Validates string length within specified bounds
+     * @param str The string to validate
+     * @param minLen Minimum allowed length
+     * @param maxLen Maximum allowed length
+     * @param errorMessage Error message to revert with if validation fails
+     */
+    function _validateStringLength(string memory str, uint256 minLen, uint256 maxLen, string memory errorMessage) internal pure {
+        uint256 length = bytes(str).length;
+        require(length >= minLen && length <= maxLen, errorMessage);
+    }
+
+    /**
+     * @dev Request IoT verification for a batch
+     * Can be called by TRANSPORTER_ROLE or MANDI_ROLE
+     */
+    function requestIoTVerification(bytes32 batchId) 
+        external 
+        whenNotPaused 
+        nonReentrant 
+        batchExists(batchId)
+    {
+        require(
+            hasRole(TRANSPORTER_ROLE, msg.sender) || hasRole(MANDI_ROLE, msg.sender),
+            "Unauthorized: Only Transporter or Mandi can request IoT verification"
+        );
+        
+        require(!cropBatches[batchId].isRecalled, "Batch is recalled");
+        
+        emit IoTDataRequested(batchId, msg.sender);
+    }
+
+    /**
+     * @dev Fulfill IoT data for a batch
+     * Can only be called by ORACLE_ROLE
+     */
+    function fulfillIoTData(
+        bytes32 batchId, 
+        int256 temperature, 
+        int256 humidity
+    ) 
+        external 
+        onlyRole(ORACLE_ROLE) 
+        whenNotPaused 
+        nonReentrant 
+        batchExists(batchId)
+    {
+        require(!cropBatches[batchId].isRecalled, "Batch is recalled");
+        
+        // Update batch IoT data
+        cropBatches[batchId].currentTemperature = temperature;
+        cropBatches[batchId].currentHumidity = humidity;
+        
+        // Check if batch is spoiled based on temperature thresholds
+        // Temperature is in hundredths of degree: 800 = 80.0°F, 320 = 32.0°F
+        bool isSpoiled = (temperature > 800 || temperature < 320);
+        cropBatches[batchId].isSpoiled = isSpoiled;
+        
+        emit IoTDataFulfilled(batchId, temperature, humidity, isSpoiled);
+    }
+
+    /**
+     * @dev Get IoT data for a batch
+     */
+    function getBatchIoTData(bytes32 batchId) 
+        external 
+        view 
+        batchExists(batchId) 
+        returns (
+            int256 temperature,
+            int256 humidity,
+            bool isSpoiled
+        )
+    {
+        CropBatch storage batch = cropBatches[batchId];
+        return (
+            batch.currentTemperature,
+            batch.currentHumidity,
+            batch.isSpoiled
+        );
+    }
+}

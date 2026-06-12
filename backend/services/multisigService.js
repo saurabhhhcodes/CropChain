@@ -67,14 +67,20 @@ class MultisigService {
         
         if (approval.initiatedBy.toString() === signer._id.toString()) throw new Error('Initiator cannot approve their own request');
         
-        const signatureData = `${requestId}:${signer._id}:${decision}:${Date.now()}`;
-        const signature = crypto.createHmac('sha256', process.env.JWT_SECRET || 'default-secret').update(signatureData).digest('hex');
+        const timestamp = Date.now();
+        const signatureData = `${requestId}:${signer._id}:${decision}:${timestamp}`;
+        const hmacSecret = process.env.MULTISIG_HMAC_SECRET;
+        if (!hmacSecret) {
+            throw new Error('MULTISIG_HMAC_SECRET is not configured. Please set it in your .env file.');
+        }
+        const signature = crypto.createHmac('sha256', hmacSecret).update(signatureData).digest('hex');
         
         await approval.addSignature({
             inspector: signer._id,
             certificationId: signer.inspectorCredentials?.certificationId || '',
             walletAddress: signer.walletAddress || '',
-            decision, signature, reason, ipAddress
+            decision, signature, reason, ipAddress,
+            timestamp // Store exact timestamp used to calculate HMAC
         });
         
         await User.findByIdAndUpdate(signer._id, {

@@ -1,13 +1,34 @@
 const User = require('../models/User');
 const generateToken = require('../utils/generateToken');
+const { generateRefreshToken } = require('../utils/generateToken');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 const { z } = require('zod');
 const apiResponse = require('../utils/apiResponse');
 const { verifyMessage } = require('ethers');
 const { VALID_ROLES, ROLES } = require('../constants/permissions');
 require('dotenv').config();
+const Redis = require('ioredis');
 
+let redis = null;
+
+if (process.env.NODE_ENV !== 'test') {
+    redis = new Redis({
+        host: process.env.REDIS_HOST || '127.0.0.1',
+        port: process.env.REDIS_PORT || 6379,
+        password: process.env.REDIS_PASSWORD || undefined,
+        db: process.env.REDIS_DB || 0,
+    });
+
+    redis.on('connect', () => {
+    console.log('Redis connected');
+});
+
+redis.on('error', (err) => {
+    console.error('Redis error:', err);
+});
+}
 // Validation Schemas
 const registerSchema = z.object({
     name: z.string()
@@ -73,6 +94,40 @@ const sanitizeUser = (user) => ({
     createdAt: user.createdAt
 });
 
+const REFRESH_COOKIE_NAME = 'refreshToken';
+
+const getRefreshCookieOptions = () => ({
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict',
+    path: '/api/auth',
+    maxAge: 7 * 24 * 60 * 60 * 1000
+});
+
+const parseCookieHeader = (cookieHeader = '') => {
+    return cookieHeader.split(';').reduce((cookies, cookie) => {
+        const [rawName, ...rawValue] = cookie.trim().split('=');
+        if (!rawName || rawValue.length === 0) return cookies;
+
+        cookies[rawName] = decodeURIComponent(rawValue.join('='));
+        return cookies;
+    }, {});
+};
+
+const buildAuthPayload = (user) => ({
+    token: generateToken(user._id, user.role, user.name),
+    user: sanitizeUser(user)
+});
+
+const attachRefreshCookie = (res, user) => {
+    res.cookie(REFRESH_COOKIE_NAME, generateRefreshToken(user._id), getRefreshCookieOptions());
+};
+
+const clearRefreshCookie = (res) => {
+    const { maxAge, ...cookieOptions } = getRefreshCookieOptions();
+    res.clearCookie(REFRESH_COOKIE_NAME, cookieOptions);
+};
+
 const registerUser = async (req, res) => {
     try {
         // Validate request body
@@ -91,7 +146,7 @@ const registerUser = async (req, res) => {
         const { name, email, password, role } = validationResult.data;
 
         // Check if user exists (case-insensitive)
-        const userExists = await User.findOne({ email: { $regex: new RegExp(`^${email}$`, 'i') } });
+        const userExists = await User.findOne({ email: email.toLowerCase() });
 
         if (userExists) {
             return res.status(409).json(
@@ -112,11 +167,9 @@ const registerUser = async (req, res) => {
         });
 
         if (user) {
+            attachRefreshCookie(res, user);
             const response = apiResponse.successResponse(
-                {
-                    token: generateToken(user._id, user.role, user.name),
-                    user: sanitizeUser(user)
-                },
+                buildAuthPayload(user),
                 'Registration successful',
                 201
             );
@@ -163,11 +216,9 @@ const loginUser = async (req, res) => {
         const user = await User.findOne({ email }).select('+password');
 
         if (user && (await bcrypt.compare(password, user.password))) {
+            attachRefreshCookie(res, user);
             const response = apiResponse.successResponse(
-                {
-                    token: generateToken(user._id, user.role, user.name),
-                    user: sanitizeUser(user)
-                },
+                buildAuthPayload(user),
                 'Login successful'
             );
             return res.json(response);
@@ -209,7 +260,7 @@ const updateProfile = async (req, res) => {
 
         if (email && email !== user.email) {
             const emailExists = await User.findOne({ 
-                email: { $regex: new RegExp(`^${email}$`, 'i') },
+                email: email.toLowerCase(),
                 _id: { $ne: user._id }
             });
 
@@ -260,45 +311,13 @@ const updateProfile = async (req, res) => {
  * This ensures role is ALWAYS assigned by backend, never by frontend.
  */
 const walletLoginSchema = z.object({
-    address: z.string()
-        .regex(/^0x[a-fA-F0-9]{40}$/, 'Invalid Ethereum address'),
-    signature: z.string()
-        .min(1, 'Signature is required'),
-    nonce: z.string().optional()
 });
 
-// In-memory nonce store with automatic cleanup to prevent memory leak
-const nonceStore = new Map();
-const NONCE_EXPIRY_TIME = 5 * 60 * 1000; // 5 minutes
-
-// Automatic cleanup job - runs every minute to remove expired nonces
-// This prevents unbounded memory growth when users never complete auth
-if (process.env.NODE_ENV !== 'test') {
-    setInterval(() => {
-        const now = Date.now();
-        let cleanedCount = 0;
-        
-        for (const [key, value] of nonceStore.entries()) {
-            if (now - value.expiresAt > 0) {
-                nonceStore.delete(key);
-                cleanedCount++;
-            }
-        }
-        
-        if (cleanedCount > 0) {
-            console.log(`[NonceStore] Cleaned up ${cleanedCount} expired nonces. Current size: ${nonceStore.size}`);
-        }
-    }, 60 * 1000); // Run every 1 minute
-}
-
-/**
- * Generate a nonce for wallet authentication
- */
 const getNonce = async (req, res) => {
-    try {
-        const { address } = req.query;
-        
-        if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
+  try {
+    const { address } = req.query;
+
+    if (!address || !/^0x[a-fA-F0-9]{40}$/.test(address)) {
             return res.status(400).json(
                 apiResponse.errorResponse('Valid address is required', 'INVALID_ADDRESS', 400)
             );
@@ -308,10 +327,13 @@ const getNonce = async (req, res) => {
         const nonce = `CropChain Authentication ${Date.now()}`;
         
         // Store nonce with expiration (5 minutes)
-        nonceStore.set(address.toLowerCase(), {
-            nonce,
-            expiresAt: Date.now() + NONCE_EXPIRY_TIME
-        });
+   await redis.set(
+    `nonce:${address.toLowerCase()}`,
+    nonce,
+    'EX',
+    300
+);
+       
 
         return res.json(apiResponse.successResponse({ nonce }, 'Nonce generated'));
     } catch (error) {
@@ -342,8 +364,7 @@ const walletLogin = async (req, res) => {
         const normalizedAddress = address.toLowerCase();
 
         // Get stored nonce
-        const storedNonce = nonceStore.get(normalizedAddress);
-        
+     const storedNonce = await redis.get(`nonce:${normalizedAddress}`);        
         // ALWAYS require stored nonce - never fall back to constant string
         if (!storedNonce) {
             return res.status(401).json(
@@ -352,16 +373,9 @@ const walletLogin = async (req, res) => {
         }
         
         // Use stored nonce (provided nonce is for backwards compatibility only)
-        const nonce = providedNonce || storedNonce.nonce;
-
+    const nonce = storedNonce;
         // Clean up expired nonces
-        if (storedNonce && storedNonce.expiresAt < Date.now()) {
-            nonceStore.delete(normalizedAddress);
-            return res.status(401).json(
-                apiResponse.unauthorizedResponse('Nonce expired. Please request a new one.')
-            );
-        }
-
+       
         // Verify the signature
         let recoveredAddress;
         try {
@@ -393,14 +407,11 @@ const walletLogin = async (req, res) => {
         }
 
         // Delete used nonce to prevent replay attacks
-        nonceStore.delete(normalizedAddress);
-
+    await redis.del(`nonce:${normalizedAddress}`);
         // Generate JWT with user's role from database
+        attachRefreshCookie(res, user);
         const response = apiResponse.successResponse(
-            {
-                token: generateToken(user._id, user.role, user.name),
-                user: sanitizeUser(user)
-            },
+            buildAuthPayload(user),
             'Wallet authentication successful'
         );
         
@@ -455,7 +466,7 @@ const walletRegister = async (req, res) => {
         const normalizedAddress = walletAddress.toLowerCase();
 
         // Get stored nonce
-        const storedNonce = nonceStore.get(normalizedAddress);
+       const storedNonce = await redis.get(`nonce:${normalizedAddress}`);
         
         // ALWAYS require stored nonce - never fall back to constant string
         if (!storedNonce) {
@@ -464,8 +475,8 @@ const walletRegister = async (req, res) => {
             );
         }
         
-        // Use stored nonce (provided nonce is for backwards compatibility only)
-        const nonce = providedNonce || storedNonce.nonce;
+        // Use stored nonce — storedNonce is a plain string returned from Redis
+        const nonce = storedNonce;
 
         // Verify signature
         let recoveredAddress;
@@ -509,13 +520,11 @@ const walletRegister = async (req, res) => {
         });
 
         // Delete used nonce
-        nonceStore.delete(normalizedAddress);
+       await redis.del(`nonce:${normalizedAddress}`);
 
+        attachRefreshCookie(res, user);
         const response = apiResponse.successResponse(
-            {
-                token: generateToken(user._id, user.role, user.name),
-                user: sanitizeUser(user)
-            },
+            buildAuthPayload(user),
             'Wallet registration successful',
             201
         );
@@ -535,11 +544,83 @@ const walletRegister = async (req, res) => {
     }
 };
 
+const refreshSession = async (req, res) => {
+    try {
+        const cookies = parseCookieHeader(req.headers.cookie);
+        const refreshToken = cookies[REFRESH_COOKIE_NAME];
+
+        if (!refreshToken) {
+            return res.status(401).json(
+                apiResponse.unauthorizedResponse('Refresh token is required')
+            );
+        }
+
+        const refreshSecret = process.env.JWT_REFRESH_SECRET;
+
+        if (!refreshSecret) {
+            console.error('JWT_REFRESH_SECRET is not configured');
+
+            return res.status(500).json(
+                apiResponse.errorResponse(
+                    'Refresh token secret is not configured',
+                    'SERVER_CONFIGURATION_ERROR',
+                    500
+                )
+            );
+        }
+
+        const decoded = jwt.verify(refreshToken, refreshSecret);
+
+        if (decoded.type !== 'refresh') {
+            return res.status(401).json(
+                apiResponse.unauthorizedResponse('Invalid refresh token')
+            );
+        }
+
+        const user = await User.findById(decoded.id).select('-password');
+
+        if (!user) {
+            clearRefreshCookie(res);
+
+            return res.status(401).json(
+                apiResponse.unauthorizedResponse('User not found')
+            );
+        }
+
+        attachRefreshCookie(res, user);
+
+        return res.json(
+            apiResponse.successResponse(
+                buildAuthPayload(user),
+                'Session refreshed'
+            )
+        );
+
+    } catch (error) {
+        clearRefreshCookie(res);
+
+        return res.status(401).json(
+            apiResponse.unauthorizedResponse(
+                'Invalid or expired refresh token'
+            )
+        );
+    }
+};
+
+const logoutUser = (req, res) => {
+    clearRefreshCookie(res);
+    return res.json(
+        apiResponse.successResponse(null, 'Logout successful')
+    );
+};
+
 module.exports = {
     registerUser,
     loginUser,
     walletLogin,
     walletRegister,
     getNonce,
-    updateProfile
+    updateProfile,
+    refreshSession,
+    logoutUser
 };

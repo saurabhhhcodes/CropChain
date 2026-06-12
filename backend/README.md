@@ -2,6 +2,26 @@
 
 Production-ready Express.js API server for the CropChain blockchain crop tracking system with comprehensive security features.
 
+## 📸 ScreenShots
+
+Here are the user interface designs for CropChain:
+
+### Home Page
+![Home Page](../ScreenShots/Home.png)
+
+### Crop Tracking
+![Track Batch](../ScreenShots/Track.png)
+
+### Smart Planting & Crop Pricing Recommendation
+![Pricing Page](../ScreenShots/Pricing.png)
+
+### Authentication
+#### Sign In
+![Sign In](../ScreenShots/Login.png)
+
+#### Sign Up
+![Sign Up](../ScreenShots/Register.png)
+
 ## 🔒 Security Features
 
 - **Rate Limiting**: Configurable protection against brute-force attacks
@@ -105,8 +125,10 @@ MONGODB_TEST_URI=mongodb://localhost:27017/cropchain_test  # Test database
 ### Authentication Configuration (Optional - For future features)
 
 ```env
-JWT_SECRET=your_super_secret_jwt_key_minimum_32_characters  # JWT signing key
-JWT_EXPIRES_IN=7d                                          # Token expiration
+JWT_SECRET=your_super_secret_jwt_key_minimum_32_characters  # Access-token signing key
+JWT_REFRESH_SECRET=your_refresh_secret_minimum_32_characters # Refresh-token signing key
+JWT_ACCESS_EXPIRES_IN=15m                                  # In-memory access-token lifetime
+JWT_REFRESH_EXPIRES_IN=7d                                  # HttpOnly refresh-cookie lifetime
 BCRYPT_ROUNDS=12                                           # Password hashing rounds
 ```
 
@@ -126,6 +148,8 @@ PUT    /api/batches/:batchId     - Update batch with new stage
 ```
 POST   /api/auth/login           - User login (rate limited: 5/15min)
 POST   /api/auth/register        - User registration (rate limited: 5/15min)
+POST   /api/auth/refresh         - Refresh access token from HttpOnly cookie
+POST   /api/auth/logout          - Clear refresh cookie
 ```
 
 ### System

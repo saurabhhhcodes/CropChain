@@ -3,9 +3,7 @@ const path = require('path');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-const mongoSanitize = require('express-mongo-sanitize');
 const jwt = require('jsonwebtoken');
-const { ethers } = require('ethers');
 const swaggerUi = require('swagger-ui-express');
 const swaggerSpec = require('./swagger');
 const connectDB = require('./config/db');
@@ -13,26 +11,23 @@ require('dotenv').config();
 const mainRoutes = require("./routes/index");
 const oracleRoutes = require("./routes/oracle");
 const validateRequest = require('./middleware/validator');
+const createNoSqlSanitizer = require('./middleware/nosqlSanitizer');
 const { chatSchema } = require("./validations/chatSchema");
 const aiService = require('./services/aiService');
 const errorHandlerMiddleware = require('./middleware/errorHandler');
 const { createBatchSchema, updateBatchSchema } = require("./validations/batchSchema");
 const { protect, adminOnly, authorizeBatchOwner, authorizeRoles, authorizeStageTransition, authorizeBlockchainTransaction } = require('./middleware/auth');
+const mongoose = require('mongoose');
 const apiResponse = require('./utils/apiResponse');
-<<<<<<< HEAD
+const oracleService = require('./services/oracleService');
 
 // Import Services
 const blockchainService = require('./services/blockchainService');
 const batchService = require('./services/batchService');
+const ccipService = require('./services/ccipService');
 const notificationService = require('./services/notificationService');
 
-// Import MongoDB Model
-const Batch = require('./models/Batch');
-=======
-const ccipService = require('./services/ccipService');
-const crypto = require('crypto');
-
-// Import MongoDB Model
+// Import MongoDB Models
 const Batch = require('./models/Batch');
 const Counter = require('./models/Counter');
 
@@ -42,37 +37,23 @@ try {
     validateStageMapping();
 } catch (error) {
     console.error('❌ CRITICAL ERROR:', error.message);
-    process.exit(1); // Exit immediately if stages are misconfigured
+    process.exit(1);
 }
 
 // ==================== GLOBAL EXCEPTION HANDLERS ====================
 
-// Handle unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
     console.error('🔥 UNHANDLED REJECTION:', reason);
     console.error('Promise:', promise);
-    // Log to external service in production
-    if (process.env.NODE_ENV === 'production') {
-        // In production, you might want to send to a logging service
-        // sendToLoggingService({ type: 'unhandledRejection', reason, promise });
-    }
 });
 
-// Handle uncaught exceptions
 process.on('uncaughtException', (error) => {
     console.error('🔥 UNCAUGHT EXCEPTION:', error);
-    // Log to external service in production
-    if (process.env.NODE_ENV === 'production') {
-        // In production, you might want to send to a logging service
-        // sendToLoggingService({ type: 'uncaughtException', error });
-    }
-    // Exit with non-zero code to indicate failure
     process.exit(1);
 });
 
 // Connect to Database
 connectDB();
->>>>>>> upstream/main
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -168,8 +149,9 @@ app.use((_req, res, next) => {
 });
 
 // Rate limiting configurations
+const isTestEnv = process.env.NODE_ENV === 'test';
 const rateLimitWindowMs = parseInt(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000;
-const rateLimitMaxRequests = parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100;
+const rateLimitMaxRequests = isTestEnv ? 10000 : (parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 100);
 
 const generalLimiter = rateLimit({
     windowMs: rateLimitWindowMs,
@@ -184,7 +166,7 @@ const generalLimiter = rateLimit({
 
 const authLimiter = rateLimit({
     windowMs: rateLimitWindowMs,
-    max: parseInt(process.env.AUTH_RATE_LIMIT_MAX) || 5,
+    max: isTestEnv ? 10000 : (parseInt(process.env.AUTH_RATE_LIMIT_MAX) || 60),
     message: {
         error: 'Too many authentication attempts from this IP, please try again later.',
         retryAfter: `${Math.ceil(rateLimitWindowMs / 60000)} minutes`
@@ -195,7 +177,7 @@ const authLimiter = rateLimit({
 
 const batchLimiter = rateLimit({
     windowMs: rateLimitWindowMs,
-    max: parseInt(process.env.BATCH_RATE_LIMIT_MAX) || 20,
+    max: isTestEnv ? 10000 : (parseInt(process.env.BATCH_RATE_LIMIT_MAX) || 20),
     message: {
         error: 'Too many batch operations from this IP, please try again later.',
         retryAfter: `${Math.ceil(rateLimitWindowMs / 60000)} minutes`
@@ -243,20 +225,13 @@ app.use(cors(corsOptions));
 const maxFileSize = parseInt(process.env.MAX_FILE_SIZE) || 10 * 1024 * 1024;
 
 app.use(express.json({
-    limit: maxFileSize,
-    verify: (req, res, buf) => {
-        try {
-            JSON.parse(buf);
-        } catch (e) {
-            res.status(400).json({ error: 'Invalid JSON' });
-        }
-    }
+    limit: maxFileSize
 }));
 
 app.use(express.urlencoded({ extended: true, limit: maxFileSize }));
 
 // NoSQL injection protection
-app.use(mongoSanitize());
+app.use(createNoSqlSanitizer());
 app.use(securityLogger);
 
 // ==================== BLOCKCHAIN SERVICE INITIALIZATION ====================
@@ -269,6 +244,45 @@ if (process.env.NODE_ENV !== 'test') {
         console.error('Blockchain configuration error:', error.message);
     }
 }
+
+// ==================== HOST HEADER VALIDATION ====================
+
+const trustedHosts = (() => {
+    const hosts = new Set(['localhost', '127.0.0.1']);
+    if (process.env.FRONTEND_URL) {
+        try {
+            const hostname = new URL(process.env.FRONTEND_URL).hostname;
+            if (hostname) hosts.add(hostname);
+        } catch { }
+    }
+    if (process.env.ALLOWED_ORIGINS) {
+        process.env.ALLOWED_ORIGINS.split(',').forEach(origin => {
+            try {
+                const hostname = new URL(origin.trim()).hostname;
+                if (hostname) hosts.add(hostname);
+            } catch { }
+        });
+    }
+    if (process.env.TRUSTED_HOSTS) {
+        process.env.TRUSTED_HOSTS.split(',').forEach(h => {
+            const trimmed = h.trim().toLowerCase();
+            if (trimmed) hosts.add(trimmed);
+        });
+    }
+    return hosts;
+})();
+
+app.use((req, res, next) => {
+    const host = req.hostname?.toLowerCase();
+    if (host && !trustedHosts.has(host)) {
+        console.warn(`[HOST BLOCKED] Unexpected Host header: ${host}`);
+        return res.status(400).json({
+            error: 'Invalid request',
+            code: 'INVALID_HOST'
+        });
+    }
+    next();
+});
 
 // ==================== ROUTES ====================
 
@@ -284,108 +298,45 @@ app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpec, {
     customSiteTitle: 'CropChain API Documentation'
 }));
 
-<<<<<<< HEAD
-=======
+
 // Blockchain configuration
-const REQUIRED_ENV_VARS = [
-    'INFURA_URL',
-    'CONTRACT_ADDRESS',
-    'PRIVATE_KEY'
-];
+const hasUrl = process.env.INFURA_URL || process.env.SEPOLIA_URL;
+const hasPrivateKey = process.env.PRIVATE_KEY || process.env.ETH_PRIVATE_KEY;
+const hasContract = process.env.CONTRACT_ADDRESS;
 
-if (process.env.NODE_ENV !== 'test') {
-    REQUIRED_ENV_VARS.forEach((key) => {
-        if (!process.env[key]) {
-            throw new Error(`Missing required environment variable: ${key}`);
-        }
-    });
+if (process.env.NODE_ENV === 'production' && process.env.STRICT_BLOCKCHAIN_CHECK === 'true') {
+    if (!hasUrl) throw new Error('Missing required environment variable: INFURA_URL or SEPOLIA_URL');
+    if (!hasContract) throw new Error('Missing required environment variable: CONTRACT_ADDRESS');
+    if (!hasPrivateKey) throw new Error('Missing required environment variable: PRIVATE_KEY or ETH_PRIVATE_KEY');
 
-    if (!/^0x[a-fA-F0-9]{64}$/.test(process.env.PRIVATE_KEY)) {
+    const pk = process.env.PRIVATE_KEY || process.env.ETH_PRIVATE_KEY;
+    const formattedPk = pk.startsWith('0x') ? pk : '0x' + pk;
+    if (!/^0x[a-fA-F0-9]{64}$/.test(formattedPk)) {
         throw new Error('Invalid PRIVATE_KEY format');
     }
-}
+} else if (process.env.NODE_ENV !== 'test') {
+    // Check and warn instead of throwing (allows running in demo/offline mode)
+    const missing = [];
+    if (!hasUrl) missing.push('INFURA_URL/SEPOLIA_URL');
+    if (!hasContract) missing.push('CONTRACT_ADDRESS');
+    if (!hasPrivateKey) missing.push('PRIVATE_KEY/ETH_PRIVATE_KEY');
 
-const PROVIDER_URL = process.env.INFURA_URL;
-const CONTRACT_ADDRESS = process.env.CONTRACT_ADDRESS;
-const PRIVATE_KEY = process.env.PRIVATE_KEY;
-
-// Initialize blockchain provider and contract (reused for listener)
-let provider;
-let contractInstance;
-let wallet;
-
-if (PROVIDER_URL && CONTRACT_ADDRESS && PRIVATE_KEY) {
-    try {
-        provider = new ethers.JsonRpcProvider(PROVIDER_URL);
-        wallet = new ethers.Wallet(PRIVATE_KEY, provider);
-
-        const contractABI = [
-            "event BatchCreated(bytes32 indexed batchId, string ipfsCID, uint256 quantity, address indexed creator)",
-            "event BatchUpdated(bytes32 indexed batchId, uint8 stage, string actorName, string location, address indexed updatedBy)",
-            "function getBatch(bytes32 batchId) view returns (tuple(bytes32 batchId, bytes32 cropTypeHash, string ipfsCID, uint256 quantity, uint256 createdAt, address creator, bool exists, bool isRecalled))",
-            "function createBatch(bytes32 batchId, bytes32 cropTypeHash, string calldata ipfsCID, uint256 quantity, string calldata actorName, string calldata location, string calldata notes) returns (bool)",
-            "function updateBatch(bytes32 batchId, uint8 stage, string calldata actorName, string calldata location, string calldata notes) returns (bool)"
-        ];
-
-        contractInstance = new ethers.Contract(CONTRACT_ADDRESS, contractABI, wallet);
-        console.log('✓ Blockchain contract instance initialized');
-    } catch (error) {
-        console.error('Failed to initialize blockchain connection:', error.message);
-        contractInstance = null;
-    }
-} else {
-    console.log('ℹ️  Blockchain not configured - running without contract instance');
-}
-
-/**
- * Generate batch ID with optional session support for transaction safety
- * @param {mongoose.ClientSession} session - MongoDB session for transaction
- * @returns {string} - Generated batch ID
- */
-async function generateBatchId(session = null) {
-    const currentYear = new Date().getFullYear();
-    const options = { new: true, upsert: true };
-    if (session) {
-        options.session = session;
-    }
-
-    const counter = await Counter.findOneAndUpdate(
-        { name: 'batchId' },
-        { $inc: { seq: 1 } },
-        options
-    );
-    return `CROP-${currentYear}-${String(counter.seq).padStart(4, '0')}`;
-}
-
-
-async function generateQRCode(batchId) {
-    try {
-        return await QRCode.toDataURL(batchId, {
-            width: 200,
-            margin: 2,
-            color: {
-                dark: '#22c55e',
-                light: '#ffffff'
-            }
-        });
-    } catch (error) {
-        console.error('Failed to generate QR code:', error);
-        return '';
+    if (missing.length > 0) {
+        console.log(`ℹ️  Missing environment variables for blockchain connection: ${missing.join(', ')}. Running in demo mode.`);
+    } else {
+        const pk = process.env.PRIVATE_KEY || process.env.ETH_PRIVATE_KEY;
+        const formattedPk = pk.startsWith('0x') ? pk : '0x' + pk;
+        if (!/^0x[a-fA-F0-9]{64}$/.test(formattedPk)) {
+            console.warn('⚠️  Invalid PRIVATE_KEY format - running in demo mode');
+        }
     }
 }
 
-function simulateBlockchainHash(data) {
-    return '0x' + crypto
-        .createHash('sha256')
-        .update(JSON.stringify(data) + Date.now().toString())
-        .digest('hex');
-}
-
->>>>>>> upstream/main
 // Import Routes
 const authRoutes = require('./routes/authRoutes');
 const verificationRoutes = require('./routes/verification');
 const approvalRoutes = require('./routes/approvalRoutes');
+const recommendRoutes = require('./routes/recommendRoutes');
 
 // Mount Auth Routes
 app.use('/api/auth', authLimiter, authRoutes);
@@ -393,65 +344,27 @@ app.use('/api/auth', authLimiter, authRoutes);
 // Mount Verification Routes
 app.use('/api/verification', generalLimiter, verificationRoutes);
 
-<<<<<<< HEAD
-// ==================== BATCH ROUTES (USING BATCH SERVICE) ====================
-=======
+// Mount Recommendation Routes
+app.use('/api/recommend', recommendRoutes);
+
+
 // Mount Approval Routes (Multi-signature for high-stakes actions)
 app.use('/api/approvals', batchLimiter, approvalRoutes);
 
 // Batch routes - ALL USING MONGODB ONLY
->>>>>>> upstream/main
+
+// ==================== BATCH ROUTES ====================
 
 // CREATE batch - requires farmer role and blockchain authorization
 // Uses MongoDB transaction to prevent race conditions in batch ID generation (CVSS 7.5 fix)
-app.post('/api/batches', batchLimiter, protect, validateRequest(createBatchSchema), async (req, res) => {
+app.post('/api/batches', batchLimiter, protect, authorizeRoles('farmer'), validateRequest(createBatchSchema), async (req, res) => {
     try {
-        session = await mongoose.startSession();
-        session.startTransaction();
-        
-        const result = await batchService.createBatch(validatedData, req.user);
+        const result = await batchService.createBatch(req.body, req.user);
 
         console.log(`[SUCCESS] Batch created: ${result.batch.batchId} by user ${req.user.id} (${req.user.email}) from IP: ${req.ip}`);
 
-<<<<<<< HEAD
         // Notify about batch creation
         notificationService.notifyBatchCreated(result.batch.batchId, req.user);
-=======
-        const batch = await Batch.create([{
-            batchId,
-            farmerId: req.user.farmerId || req.user.id, // Use authenticated user's ID
-            farmerName: validatedData.farmerName || req.user.name,
-            farmerWalletAddress: (req.user.walletAddress || '').toLowerCase(),
-            farmerAddress: validatedData.farmerAddress || req.user.address || '',
-            cropType: validatedData.cropType,
-            quantity: validatedData.quantity,
-            harvestDate: validatedData.harvestDate,
-            origin: validatedData.origin,
-            certifications: validatedData.certifications,
-            description: validatedData.description,
-            currentStage: "farmer",
-            isRecalled: false,
-            qrCode,
-            blockchainHash: simulateBlockchainHash(validatedData),
-            syncStatus: 'pending',
-            crossChain: {
-                status: 'not_required'
-            },
-            updates: [{
-                stage: "farmer",
-                actor: validatedData.farmerName || req.user.name,
-                location: validatedData.origin,
-                timestamp: validatedData.harvestDate,
-                notes: validatedData.description || "Initial harvest recorded"
-            }]
-        }], { session });
-
-        // Commit the transaction
-        await session.commitTransaction();
-        session.endSession();
-
-        console.log(`[SUCCESS] Batch created: ${batchId} by user ${req.user.id} (${req.user.email}) from IP: ${req.ip}`);
->>>>>>> upstream/main
 
         const response = apiResponse.successResponse(
             { batch: result.batch },
@@ -482,16 +395,13 @@ app.post('/api/batches', batchLimiter, protect, validateRequest(createBatchSchem
     }
 });
 
-// GET one batch
-app.get('/api/batches/:batchId', batchLimiter, async (req, res) => {
+// GET one batch - requires authentication
+app.get('/api/batches/:batchId', batchLimiter, protect, async (req, res) => {
     try {
         const { batchId } = req.params;
-<<<<<<< HEAD
         
+
         const result = await batchService.getBatch(batchId);
-=======
-        const batch = await Batch.findOne({ batchId }).lean();
->>>>>>> upstream/main
 
         if (!result.success) {
             console.log(`[NOT FOUND] Batch lookup failed: ${batchId} from IP: ${req.ip}`);
@@ -528,90 +438,8 @@ app.put('/api/batches/:batchId', batchLimiter, protect, authorizeBatchOwner, aut
 
         console.log(`[SUCCESS] Batch updated: ${batchId} to stage ${validatedData.stage} by ${validatedData.actor} from IP: ${req.ip}`);
 
-<<<<<<< HEAD
         // Notify about batch update
         notificationService.notifyBatchUpdated(batchId, validatedData.stage, req.user);
-=======
-        const shouldDispatchCrossChain = normalizedStage === 'retailer' && ccipService.isEnabled();
-
-        const crossChainState = shouldDispatchCrossChain
-            ? {
-                status: 'pending',
-                destinationChain: process.env.CCIP_DESTINATION_LABEL || 'ethereum',
-                error: '',
-                lastAttemptAt: new Date()
-            }
-            : {
-                status: 'not_required',
-                destinationChain: '',
-                messageId: '',
-                txHash: '',
-                error: '',
-                lastAttemptAt: null
-            };
-
-        const batch = await Batch.findOneAndUpdate(
-            { batchId },
-            {
-                $push: { updates: update },
-                currentStage: normalizedStage,
-                blockchainHash: simulateBlockchainHash(update),
-                syncStatus: 'pending',
-                crossChain: crossChainState
-            },
-            { new: true }
-        );
-
-        if (shouldDispatchCrossChain) {
-            try {
-                const syncResult = await ccipService.dispatchRetailerProof(batch, update);
-                await Batch.updateOne(
-                    { batchId },
-                    {
-                        $set: {
-                            'crossChain.status': 'sent',
-                            'crossChain.destinationChain': syncResult.destinationChain,
-                            'crossChain.messageId': syncResult.messageId,
-                            'crossChain.txHash': syncResult.txHash,
-                            'crossChain.error': '',
-                            'crossChain.lastAttemptAt': new Date()
-                        }
-                    }
-                );
-
-                batch.crossChain = {
-                    ...batch.crossChain,
-                    status: 'sent',
-                    destinationChain: syncResult.destinationChain,
-                    messageId: syncResult.messageId,
-                    txHash: syncResult.txHash,
-                    error: '',
-                    lastAttemptAt: new Date()
-                };
-            } catch (ccipError) {
-                console.error(`[CCIP ERROR] Failed to dispatch retailer proof for ${batchId}:`, ccipError.message);
-                await Batch.updateOne(
-                    { batchId },
-                    {
-                        $set: {
-                            'crossChain.status': 'failed',
-                            'crossChain.error': ccipError.message,
-                            'crossChain.lastAttemptAt': new Date()
-                        }
-                    }
-                );
-
-                batch.crossChain = {
-                    ...batch.crossChain,
-                    status: 'failed',
-                    error: ccipError.message,
-                    lastAttemptAt: new Date()
-                };
-            }
-        }
-
-        console.log(`[SUCCESS] Batch updated: ${batchId} to stage ${normalizedStage} by ${validatedData.actor} from IP: ${req.ip}`);
->>>>>>> upstream/main
 
         const response = apiResponse.successResponse(
             { batch: result.batch },
@@ -662,58 +490,17 @@ app.post(
     }
 );
 
-// GET all batches
+// GET all batches - requires authentication
 // NOTE: This endpoint uses .lean() and compound indexes for optimal performance.
 // The new { currentStage: 1, createdAt: -1 } compound index handles pagination and sorting efficiently.
-app.get('/api/batches', batchLimiter, async (req, res) => {
+app.get('/api/batches', batchLimiter, protect, async (req, res) => {
     try {
-<<<<<<< HEAD
         const result = await batchService.getAllBatches();
-=======
-        // Use aggregation for statistics to avoid loading all batches into memory
-        const statsPipeline = [
-            {
-                $group: {
-                    _id: null,
-                    totalBatches: { $sum: 1 },
-                    totalQuantity: { $sum: "$quantity" },
-                    uniqueFarmers: { $addToSet: "$farmerName" },
-                    recentBatches: {
-                        $sum: {
-                            $cond: [
-                                { $gte: ["$createdAt", new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)] },
-                                1,
-                                0
-                            ]
-                        }
-                    }
-                }
-            },
-            {
-                $project: {
-                    _id: 0,
-                    totalBatches: 1,
-                    totalQuantity: 1,
-                    totalFarmers: { $size: "$uniqueFarmers" },
-                    recentBatches: 1
-                }
-            }
-        ];
 
-        const [stats] = await Batch.aggregate(statsPipeline);
-        
-        // Use lean() for read-only queries to skip Mongoose document hydration
-        const allBatches = await Batch.find().lean().sort({ createdAt: -1 });
->>>>>>> upstream/main
-
-        console.log(`[SUCCESS] Batches list retrieved from IP: ${req.ip}`);
+        console.log(`[SUCCESS] Batches list retrieved by user: ${req.user?.id} from IP: ${req.ip}`);
 
         const response = apiResponse.successResponse(
-<<<<<<< HEAD
             { stats: result.stats, batches: result.batches },
-=======
-            { stats: stats || { totalBatches: 0, totalQuantity: 0, totalFarmers: 0, recentBatches: 0 }, batches: allBatches },
->>>>>>> upstream/main
             'Batches retrieved successfully'
         );
         res.json(response);
@@ -729,7 +516,6 @@ app.get('/api/batches', batchLimiter, async (req, res) => {
     }
 });
 
-<<<<<<< HEAD
 // ==================== AI SERVICE ====================
 
 // Create batch service interface for AI service
@@ -741,58 +527,46 @@ const batchServiceForAI = {
 
     async getDashboardStats() {
         return await batchService.getDashboardStats();
-=======
-// AI Service - MongoDB only with optimized queries
-const batchServiceForAI = {
-    async getBatch(batchId) {
-        return await Batch.findOne({ batchId }).lean();
-    },
-
-    async getDashboardStats() {
-        // Use aggregation for dashboard statistics to avoid loading all batches into memory
-        const statsPipeline = [
-            {
-                $group: {
-                    _id: null,
-                    totalBatches: { $sum: 1 },
-                    totalQuantity: { $sum: "$quantity" },
-                    uniqueFarmers: { $addToSet: "$farmerName" },
-                    recentBatches: {
-                        $sum: {
-                            $cond: [
-                                { $gte: ["$createdAt", new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)] },
-                                1,
-                                0
-                            ]
-                        }
-                    }
-                }
-            },
-            {
-                $project: {
-                    _id: 0,
-                    totalBatches: 1,
-                    totalQuantity: 1,
-                    totalFarmers: { $size: "$uniqueFarmers" },
-                    recentBatches: 1
-                }
-            }
-        ];
-
-        const [stats] = await Batch.aggregate(statsPipeline);
-        return {
-            stats: stats || { totalBatches: 0, totalQuantity: 0, totalFarmers: 0, recentBatches: 0 }
-        };
->>>>>>> upstream/main
     }
 };
 
 // AI Chat endpoint
-app.post('/api/ai/chat', batchLimiter, validateRequest(chatSchema), async (req, res) => {
+app.post('/api/ai/chat', batchLimiter, protect, validateRequest(chatSchema), async (req, res) => {
     try {
         const { message } = req.body;
 
         console.log(`[AI CHAT] Request from IP: ${req.ip} - Message: "${message.substring(0, 50)}..."`);
+
+        const acceptsEventStream = req.headers.accept?.includes('text/event-stream');
+
+        if (acceptsEventStream) {
+            res.setHeader('Content-Type', 'text/event-stream');
+            res.setHeader('Cache-Control', 'no-cache, no-transform');
+            res.setHeader('Connection', 'keep-alive');
+            res.flushHeaders?.();
+
+            const sendEvent = (event, data) => {
+                res.write(`event: ${event}\n`);
+                res.write(`data: ${JSON.stringify(data)}\n\n`);
+            };
+
+            const aiResponse = await aiService.chatStream(message, batchServiceForAI, (token) => {
+                sendEvent('token', { token });
+            });
+
+            sendEvent('done', {
+                response: aiResponse.message,
+                timestamp: new Date().toISOString(),
+                ...(aiResponse.functionCalled && {
+                    functionCalled: aiResponse.functionCalled,
+                    functionResult: aiResponse.functionResult
+                })
+            });
+
+            res.end();
+            console.log(`[AI CHAT SUCCESS] Streamed response generated for IP: ${req.ip}`);
+            return;
+        }
 
         const aiResponse = await aiService.chat(message, batchServiceForAI);
 
@@ -814,6 +588,15 @@ app.post('/api/ai/chat', batchLimiter, validateRequest(chatSchema), async (req, 
     } catch (error) {
         notificationService.notifyError('AI chat', error);
         console.error('AI Chat error:', error);
+
+        if (res.headersSent) {
+            res.write(`event: error\n`);
+            res.write(`data: ${JSON.stringify({
+                error: "I'm sorry, I'm having trouble processing your request right now. Please try asking about batch tracking, QR codes, or supply chain processes."
+            })}\n\n`);
+            res.end();
+            return;
+        }
 
         const response = apiResponse.errorResponse(
             "I'm sorry, I'm having trouble processing your request right now. Please try asking about batch tracking, QR codes, or supply chain processes.",
@@ -907,39 +690,12 @@ const createAdmin = require('./scripts/create-admin');
 // Import blockchain listener
 const startListener = require('./services/blockchainListener');
 
-// Global error handlers for uncaught exceptions and unhandled rejections
-process.on('uncaughtException', (err) => {
-    console.error('✗ Uncaught Exception:', err.message);
-    console.error('Stack:', err.stack);
-    gracefulShutdown('uncaughtException');
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-    console.error('✗ Unhandled Rejection at:', promise);
-    console.error('Reason:', reason);
-    gracefulShutdown('unhandledRejection');
-});
-
 // Handle termination signals
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-<<<<<<< HEAD
-// ==================== SERVER STARTUP ====================
-
-// Connect to Database
-connectDB();
-
-// Import createAdmin script
-const createAdmin = require('./scripts/create-admin');
-
-// Import blockchain listener
-const startListener = require('./services/blockchainListener');
-
-// Start server
-=======
 // Start server using HTTP server (with Socket.IO attached)
->>>>>>> upstream/main
+// Start server
 if (process.env.NODE_ENV !== 'test') {
     server.listen(PORT, async () => {
         console.log(`🚀 CropChain API server running on port ${PORT}`);
@@ -1002,13 +758,17 @@ if (process.env.NODE_ENV !== 'test') {
             console.log('ℹ️  CCIP service not configured - cross-chain dispatch disabled');
         }
 
-        // Start Oracle service for IoT data verification
-        try {
-            await oracleService.initialize();
-            console.log('🔮 Oracle service started successfully');
-        } catch (error) {
-            console.error('❌ Failed to start Oracle service:', error.message);
-            console.log('⚠️  Continuing without Oracle service...');
+        // Start Oracle service for IoT data verification if blockchain is active
+        if (blockchainService.isAvailable() && process.env.ORACLE_PRIVATE_KEY) {
+            try {
+                await oracleService.initialize();
+                console.log('🔮 Oracle service started successfully');
+            } catch (error) {
+                console.error('❌ Failed to start Oracle service:', error.message);
+                console.log('⚠️  Continuing without Oracle service...');
+            }
+        } else {
+            console.log('ℹ️  Oracle service disabled (blockchain running in demo mode or ORACLE_PRIVATE_KEY missing)');
         }
     });
 }

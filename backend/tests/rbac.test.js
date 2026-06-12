@@ -1,23 +1,164 @@
+process.env.NODE_ENV = 'test';
+process.env.JWT_SECRET = 'test_secret';
+
 const request = require('supertest');
 const mongoose = require('mongoose');
+const jwt = require('jsonwebtoken');
+
+// Mock storage
+const inMemoryUsers = [];
+const inMemoryBatches = [];
+
+class MockUserDoc {
+    constructor(data) {
+        Object.assign(this, data);
+    }
+    toObject() { return this; }
+}
+
+class MockBatchDoc {
+    constructor(data) {
+        Object.assign(this, data);
+        if (!this.updates) this.updates = [];
+    }
+    save() { return Promise.resolve(this); }
+    toObject() { return this; }
+}
+
+const mockCounter = {
+    findOneAndUpdate: jest.fn().mockImplementation(async () => {
+        return { seq: 1 };
+    })
+};
+
+const mockUser = {
+    create: jest.fn().mockImplementation(async (data) => {
+        const id = new mongoose.Types.ObjectId();
+        const user = new MockUserDoc({
+            _id: id,
+            id: id.toString(),
+            status: 'active',
+            ...data
+        });
+        inMemoryUsers.push(user);
+        return user;
+    }),
+    deleteMany: jest.fn().mockImplementation(async () => {
+        inMemoryUsers.length = 0;
+    }),
+    findById: jest.fn().mockImplementation((id) => {
+        const idStr = id.toString();
+        const user = inMemoryUsers.find(u => u._id.toString() === idStr);
+        return {
+            select: jest.fn().mockResolvedValue(user)
+        };
+    }),
+    findOne: jest.fn().mockImplementation(async (query) => {
+        return inMemoryUsers.find(u => u.email === query.email);
+    })
+};
+
+const mockBatch = {
+    create: jest.fn().mockImplementation(async (dataArray, options) => {
+        const data = Array.isArray(dataArray) ? dataArray[0] : dataArray;
+        const batch = new MockBatchDoc({
+            _id: new mongoose.Types.ObjectId(),
+            batchId: data.batchId || 'BATCH000001',
+            currentStage: data.currentStage || 'farmer',
+            ...data
+        });
+        inMemoryBatches.push(batch);
+        return Array.isArray(dataArray) ? [batch] : batch;
+    }),
+    deleteMany: jest.fn().mockImplementation(async () => {
+        inMemoryBatches.length = 0;
+    }),
+    findOne: jest.fn().mockImplementation(async (query) => {
+        return inMemoryBatches.find(b => b.batchId === query.batchId);
+    }),
+    findOneAndUpdate: jest.fn().mockImplementation(async (query, update, options) => {
+        const batch = inMemoryBatches.find(b => b.batchId === query.batchId);
+        if (!batch) return null;
+        if (update.$push && update.$push.updates) {
+            batch.updates.push(update.$push.updates);
+        }
+        if (update.currentStage) {
+            batch.currentStage = update.currentStage;
+        }
+        return batch;
+    })
+};
+
+// Mock Mongoose module
+jest.mock('mongoose', () => {
+    const originalMongoose = jest.requireActual('mongoose');
+    const Schema = jest.fn().mockImplementation(() => {
+        return {
+            index: jest.fn(),
+            virtual: jest.fn().mockReturnValue({
+                get: jest.fn().mockReturnThis(),
+                set: jest.fn().mockReturnThis()
+            }),
+            set: jest.fn(),
+            pre: jest.fn(),
+            post: jest.fn(),
+            methods: {},
+            statics: {}
+        };
+    });
+    Schema.Types = {
+        ObjectId: 'ObjectId',
+        String: 'String',
+        Number: 'Number',
+        Date: 'Date',
+        Boolean: 'Boolean'
+    };
+
+    return {
+        ...originalMongoose,
+        Schema: Schema,
+        model: jest.fn((name) => {
+            if (name === 'Counter') return mockCounter;
+            if (name === 'Batch') return mockBatch;
+            if (name === 'User') return mockUser;
+            return {
+                findOne: jest.fn(),
+                create: jest.fn()
+            };
+        }),
+        connect: jest.fn(),
+        startSession: jest.fn().mockReturnValue({
+            startTransaction: jest.fn(),
+            commitTransaction: jest.fn(),
+            abortTransaction: jest.fn(),
+            endSession: jest.fn()
+        }),
+        connection: {
+            host: 'localhost',
+            readyState: 1, // Simulate connected
+            close: jest.fn()
+        }
+    };
+});
+
+jest.mock('../models/Counter', () => mockCounter);
+jest.mock('../models/Batch', () => mockBatch);
+jest.mock('../models/User', () => mockUser);
+
 const app = require('../server');
 const User = require('../models/User');
 const Batch = require('../models/Batch');
-const jwt = require('jsonwebtoken');
 
 describe('RBAC Backend Tests', () => {
     let tokens = {};
     let testBatch;
 
     beforeAll(async () => {
-        // Connect to test database
-        if (mongoose.connection.readyState === 0) {
-            await mongoose.connect(process.env.MONGODB_URI || 'mongodb://localhost:27017/cropchain-test');
-        }
+        // No connection needed for mocks
     });
 
     afterAll(async () => {
-        await mongoose.connection.close();
+        // No connection teardown needed for mocks
     });
 
     beforeEach(async () => {
@@ -28,26 +169,39 @@ describe('RBAC Backend Tests', () => {
         // Create test users with different roles
         const users = [
             { name: 'Test Farmer', email: 'farmer@test.com', password: 'Password123!', role: 'farmer' },
+            { name: 'Another Farmer', email: 'farmer2@test.com', password: 'Password123!', role: 'farmer' },
             { name: 'Test Mandi', email: 'mandi@test.com', password: 'Password123!', role: 'mandi' },
             { name: 'Test Transporter', email: 'transporter@test.com', password: 'Password123!', role: 'transporter' },
             { name: 'Test Retailer', email: 'retailer@test.com', password: 'Password123!', role: 'retailer' },
-            { name: 'Test Admin', email: 'admin@test.com', password: 'Password123!', role: 'admin' }
+            { name: 'Test Admin', email: 'admin@test.com', password: 'Password123!', role: 'admin' },
+            { name: 'Test Inspector', email: 'inspector@test.com', password: 'Password123!', role: 'quality_inspector' },
+            { name: 'Test Future Role', email: 'future@test.com', password: 'Password123!', role: 'processor' }
         ];
 
         for (const userData of users) {
             const user = await User.create(userData);
-            tokens[userData.role] = jwt.sign({ id: user._id }, process.env.JWT_SECRET || 'test-secret');
+            const key = userData.email.split('@')[0];
+            tokens[key] = jwt.sign({ id: user._id }, process.env.JWT_SECRET || 'test-secret');
+            
+            // Map roles directly for backward compatibility
+            if (userData.role !== 'farmer') {
+                tokens[userData.role] = tokens[key];
+            } else if (userData.email === 'farmer@test.com') {
+                tokens['farmer'] = tokens[key];
+            }
         }
     });
 
     describe('Batch Creation RBAC', () => {
         it('Should allow farmer to create batch', async () => {
             const batchData = {
-                cropType: 'Wheat',
-                quantity: 100,
-                harvestDate: '2024-01-01',
-                origin: 'Kansas',
+                farmerId: 'FARM123',
                 farmerName: 'Test Farmer',
+                farmerAddress: '123 Green Lane',
+                cropType: 'wheat',
+                quantity: 100,
+                harvestDate: '2024-01-01T00:00:00.000Z',
+                origin: 'Kansas USA',
                 description: 'Test batch'
             };
 
@@ -58,17 +212,19 @@ describe('RBAC Backend Tests', () => {
                 .expect(201);
 
             expect(response.body.success).toBe(true);
-            expect(response.body.data.batch.cropType).toBe('Wheat');
+            expect(response.body.data.batch.cropType).toBe('wheat');
             testBatch = response.body.data.batch;
         });
 
         it('Should reject mandi trying to create batch', async () => {
             const batchData = {
-                cropType: 'Rice',
-                quantity: 50,
-                harvestDate: '2024-01-01',
-                origin: 'California',
+                farmerId: 'FARM123',
                 farmerName: 'Test Mandi',
+                farmerAddress: '123 Green Lane',
+                cropType: 'rice',
+                quantity: 50,
+                harvestDate: '2024-01-01T00:00:00.000Z',
+                origin: 'California USA',
                 description: 'Unauthorized batch'
             };
 
@@ -84,11 +240,13 @@ describe('RBAC Backend Tests', () => {
 
         it('Should reject transporter trying to create batch', async () => {
             const batchData = {
-                cropType: 'Corn',
-                quantity: 75,
-                harvestDate: '2024-01-01',
-                origin: 'Iowa',
+                farmerId: 'FARM123',
                 farmerName: 'Test Transporter',
+                farmerAddress: '123 Green Lane',
+                cropType: 'corn',
+                quantity: 75,
+                harvestDate: '2024-01-01T00:00:00.000Z',
+                origin: 'Iowa State USA',
                 description: 'Unauthorized batch'
             };
 
@@ -104,11 +262,13 @@ describe('RBAC Backend Tests', () => {
 
         it('Should reject retailer trying to create batch', async () => {
             const batchData = {
-                cropType: 'Soy',
-                quantity: 60,
-                harvestDate: '2024-01-01',
-                origin: 'Texas',
+                farmerId: 'FARM123',
                 farmerName: 'Test Retailer',
+                farmerAddress: '123 Green Lane',
+                cropType: 'tomato',
+                quantity: 60,
+                harvestDate: '2024-01-01T00:00:00.000Z',
+                origin: 'Texas State USA',
                 description: 'Unauthorized batch'
             };
 
@@ -124,11 +284,13 @@ describe('RBAC Backend Tests', () => {
 
         it('Should allow admin to create batch (admin override)', async () => {
             const batchData = {
-                cropType: 'Barley',
-                quantity: 80,
-                harvestDate: '2024-01-01',
-                origin: 'Nebraska',
+                farmerId: 'FARM123',
                 farmerName: 'Test Admin',
+                farmerAddress: '123 Green Lane',
+                cropType: 'rice',
+                quantity: 80,
+                harvestDate: '2024-01-01T00:00:00.000Z',
+                origin: 'Nebraska USA',
                 description: 'Admin batch'
             };
 
@@ -146,11 +308,13 @@ describe('RBAC Backend Tests', () => {
         beforeEach(async () => {
             // Create a test batch for update tests
             const batchData = {
-                cropType: 'Wheat',
-                quantity: 100,
-                harvestDate: '2024-01-01',
-                origin: 'Kansas',
+                farmerId: 'FARM123',
                 farmerName: 'Test Farmer',
+                farmerAddress: '123 Green Lane',
+                cropType: 'wheat',
+                quantity: 100,
+                harvestDate: '2024-01-01T00:00:00.000Z',
+                origin: 'Kansas USA',
                 description: 'Test batch for updates'
             };
 
@@ -290,6 +454,63 @@ describe('RBAC Backend Tests', () => {
 
             expect(response.body.success).toBe(true);
             expect(response.body.data.batch.currentStage).toBe('mandi');
+        });
+
+        it('Should reject farmer trying to update another farmer\'s batch', async () => {
+            const updateData = {
+                stage: 'farmer',
+                actor: 'Another Farmer',
+                location: 'Farm Location',
+                timestamp: '2024-01-02',
+                notes: 'Farmer trying to update someone else\'s batch'
+            };
+
+            const response = await request(app)
+                .put(`/api/batches/${testBatch.batchId}`)
+                .set('Authorization', `Bearer ${tokens.farmer2}`)
+                .send(updateData)
+                .expect(403);
+
+            expect(response.body.success).toBe(false);
+            expect(response.body.message).toContain('Unauthorized access to batch');
+        });
+
+        it('Should reject quality inspector trying to update batch (lack of update permission)', async () => {
+            const updateData = {
+                stage: 'farmer',
+                actor: 'Test Inspector',
+                location: 'Testing Lab',
+                timestamp: '2024-01-02',
+                notes: 'Quality Inspector trying to update batch'
+            };
+
+            const response = await request(app)
+                .put(`/api/batches/${testBatch.batchId}`)
+                .set('Authorization', `Bearer ${tokens.inspector}`)
+                .send(updateData)
+                .expect(403);
+
+            expect(response.body.success).toBe(false);
+            expect(response.body.message).toContain('Unauthorized access to batch');
+        });
+
+        it('Should reject unregistered or future roles trying to update batch (deny-by-default)', async () => {
+            const updateData = {
+                stage: 'farmer',
+                actor: 'Test Processor',
+                location: 'Processing Plant',
+                timestamp: '2024-01-02',
+                notes: 'Future role trying to update batch'
+            };
+
+            const response = await request(app)
+                .put(`/api/batches/${testBatch.batchId}`)
+                .set('Authorization', `Bearer ${tokens.future}`)
+                .send(updateData)
+                .expect(403);
+
+            expect(response.body.success).toBe(false);
+            expect(response.body.message).toContain('Unauthorized access to batch');
         });
     });
 
